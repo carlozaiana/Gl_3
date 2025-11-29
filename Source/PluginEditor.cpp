@@ -4,14 +4,14 @@
 SmoothScopeAudioProcessorEditor::SmoothScopeAudioProcessorEditor (SmoothScopeAudioProcessor& p)
     : AudioProcessorEditor (&p), audioProcessor (p)
 {
-    // Initialize history buffer with 0
+    // Initialize buffers
     historyBuffer.resize(historySize, 0.0f);
+    overviewBuffer.resize(overviewSize, 0.0f);
 
     setResizable(true, true);
     setResizeLimits(300, 200, 2000, 1000);
     setSize (800, 400);
 
-    // 60 FPS refresh rate
     startTimerHz(60);
 }
 
@@ -22,7 +22,6 @@ SmoothScopeAudioProcessorEditor::~SmoothScopeAudioProcessorEditor()
 
 void SmoothScopeAudioProcessorEditor::timerCallback()
 {
-    // Pull data from Audio Processor's FIFO
     bool newData = false;
     
     while (true)
@@ -30,17 +29,30 @@ void SmoothScopeAudioProcessorEditor::timerCallback()
         int currentRead = audioProcessor.fifoReadIndex.load(std::memory_order_acquire);
         int currentWrite = audioProcessor.fifoWriteIndex.load(std::memory_order_acquire);
 
-        if (currentRead == currentWrite)
-            break; 
+        if (currentRead == currentWrite) break; 
 
         float val = audioProcessor.fifoBuffer[currentRead];
 
         int nextRead = (currentRead + 1) % SmoothScopeAudioProcessor::fifoSize;
         audioProcessor.fifoReadIndex.store(nextRead, std::memory_order_release);
 
-        // Add to GUI History Circular Buffer
+        // 1. Write to High Res History
         historyBuffer[historyWriteIndex] = val;
         historyWriteIndex = (historyWriteIndex + 1) % historySize;
+
+        // 2. Accumulate for Low Res Overview
+        if (val > currentBatchMax) currentBatchMax = val;
+        currentBatchCount++;
+
+        if (currentBatchCount >= decimationFactor)
+        {
+            overviewBuffer[overviewWriteIndex] = currentBatchMax;
+            overviewWriteIndex = (overviewWriteIndex + 1) % overviewSize;
+            
+            // Reset accumulator
+            currentBatchMax = 0.0f;
+            currentBatchCount = 0;
+        }
         
         newData = true;
     }
@@ -49,18 +61,10 @@ void SmoothScopeAudioProcessorEditor::timerCallback()
         repaint();
 }
 
-// Helper: Get interpolated value from circular buffer (for smooth Zoom In)
-float SmoothScopeAudioProcessorEditor::getInterpolatedValue(float index) const
+// Helper: Linear Interpolation for Smooth Zoom In
+float SmoothScopeAudioProcessorEditor::getInterpolatedHistory(float samplesAgo) const
 {
-    // index is "samples ago". 0 is most recent.
-    // Map to actual buffer index.
-    
-    // Most recent sample is at (historyWriteIndex - 1)
-    // 'index' moves backwards from there.
-    
-    float readPos = (float)(historyWriteIndex - 1) - index;
-    
-    // Handle wrapping for negative numbers manually to be safe with floats
+    float readPos = (float)(historyWriteIndex - 1) - samplesAgo;
     while (readPos < 0) readPos += (float)historySize;
     while (readPos >= (float)historySize) readPos -= (float)historySize;
 
@@ -68,41 +72,15 @@ float SmoothScopeAudioProcessorEditor::getInterpolatedValue(float index) const
     int idx1 = (idx0 + 1) % historySize;
     float frac = readPos - (float)idx0;
 
-    float v0 = historyBuffer[idx0];
-    float v1 = historyBuffer[idx1];
-
-    return v0 + frac * (v1 - v0);
+    return historyBuffer[idx0] + frac * (historyBuffer[idx1] - historyBuffer[idx0]);
 }
 
-// Helper: Get Max value in a range (for accurate Zoom Out/Peak detection)
-float SmoothScopeAudioProcessorEditor::getMaxValueInRange(int startOffset, int endOffset) const
+// Helper: Direct lookup for Overview
+float SmoothScopeAudioProcessorEditor::getOverviewSample(int blocksAgo) const
 {
-    // offsets are "samples ago"
-    float maxVal = 0.0f;
-    
-    // Clamp range
-    if (startOffset < 0) startOffset = 0;
-    if (endOffset >= historySize) endOffset = historySize - 1;
-    if (startOffset > endOffset) return 0.0f;
-
-    // Iterate backwards relative to write head
-    int currentIdx = historyWriteIndex - 1 - startOffset;
-    // Fix initial wrap
-    if (currentIdx < 0) currentIdx += historySize;
-
-    int count = endOffset - startOffset + 1;
-    
-    for (int i = 0; i < count; ++i)
-    {
-        float v = historyBuffer[currentIdx];
-        if (v > maxVal) maxVal = v;
-
-        // Move back one
-        currentIdx--;
-        if (currentIdx < 0) currentIdx = historySize - 1;
-    }
-    
-    return maxVal;
+    int idx = overviewWriteIndex - 1 - blocksAgo;
+    while (idx < 0) idx += overviewSize;
+    return overviewBuffer[idx];
 }
 
 void SmoothScopeAudioProcessorEditor::paint (juce::Graphics& g)
@@ -114,78 +92,83 @@ void SmoothScopeAudioProcessorEditor::paint (juce::Graphics& g)
     float height = (float)area.getHeight();
     float midY = height / 2.0f;
 
-    // Grid
     g.setColour(juce::Colours::darkgrey.withAlpha(0.3f));
     g.drawHorizontalLine((int)midY, 0.0f, width);
 
     juce::Path path;
     
-    // --- OPTIMIZED RENDERING ALGORITHM ---
-    // Instead of looping through history samples, we loop through screen pixels.
-    // This decouples rendering cost from zoom level.
+    // Logic: 
+    // If zoomX is small (zoomed out), using raw history is slow and jittery.
+    // We switch to 'overviewBuffer' if 1 pixel represents roughly 'decimationFactor' samples or more.
     
-    // Samples per horizontal pixel
-    // If zoomX = 1.0, step = 1 sample per pixel.
-    // If zoomX = 0.01, step = 100 samples per pixel.
-    float samplesPerPixel = 1.0f / zoomX;
-    
-    // Start the path at the right edge (current time, offset 0)
-    float firstVal = getInterpolatedValue(0.0f);
-    float startY = midY - (firstVal * midY * 0.9f * zoomY);
-    startY = juce::jlimit(0.0f, height, startY);
-    path.startNewSubPath(width, startY);
+    // Threshold: If we are compressing more than 128 samples into a pixel, switch to Overview.
+    // (decimationFactor is 256).
+    bool useOverview = (zoomX < (1.0f / 64.0f)); 
 
-    // Loop x from Right to Left
-    // We use a step of 1 pixel (or larger for even higher performance, e.g. 2)
-    for (float x = width - 1.0f; x >= 0.0f; x -= 1.0f)
+    if (useOverview)
     {
-        // Calculate how many "samples ago" corresponds to this pixel X
-        float distanceFromRight = width - x;
+        // --- RENDER MODE: OVERVIEW (Stable, Zoomed Out) ---
         
-        // range in "samples ago" covered by this pixel
-        float sampleIndexCenter = distanceFromRight * samplesPerPixel;
+        // Effective zoom for the overview buffer
+        // Since overview is 256x smaller, the pixels-per-point is 256x larger.
+        float overviewZoom = zoomX * (float)decimationFactor;
         
-        float yVal = 0.0f;
+        // Start drawing from the most recent block
+        float firstVal = getOverviewSample(0);
+        float startY = midY - (firstVal * midY * 0.9f * zoomY);
+        startY = juce::jlimit(0.0f, height, startY);
+        path.startNewSubPath(width, startY);
 
-        // STRATEGY SWITCHING:
-        if (samplesPerPixel < 1.0f)
+        // Iterate through the COMPRESSED buffer
+        // Even for 3 hours of data (1M samples), overview is only ~4000 points.
+        // We can loop through ALL necessary points without skipping.
+        
+        for (int i = 1; i < overviewSize; ++i)
         {
-            // ZOOMED IN: Linear Interpolation
-            // When we have more pixels than samples, we need to interpolate 
-            // to create a smooth line instead of steps.
-            float val = getInterpolatedValue(sampleIndexCenter);
-            yVal = midY - (val * midY * 0.9f * zoomY);
-        }
-        else
-        {
-            // ZOOMED OUT: Peak Detection
-            // When one pixel covers many samples (e.g., 1000), we cannot just pick one
-            // or we get aliasing (jitter). We must find the MAX in that range.
+            float xPos = width - ((float)i * overviewZoom);
             
-            int startRange = (int)((distanceFromRight - 1.0f) * samplesPerPixel); 
-            int endRange   = (int)(distanceFromRight * samplesPerPixel);
-            
-            // Ensure we look at at least one sample
-            if (endRange <= startRange) endRange = startRange + 1;
+            if (xPos < -50.0f) break; // Optimization
 
-            float val = getMaxValueInRange(startRange, endRange);
-            yVal = midY - (val * midY * 0.9f * zoomY);
+            float val = getOverviewSample(i);
+            float y = midY - (val * midY * 0.9f * zoomY);
+            y = juce::jlimit(0.0f, height, y);
+
+            path.lineTo(xPos, y);
         }
-
-        yVal = juce::jlimit(0.0f, height, yVal);
-        path.lineTo(x, yVal);
+    }
+    else
+    {
+        // --- RENDER MODE: RAW HISTORY (Smooth, Zoomed In) ---
         
-        // Optimization check: If we've exceeded our history buffer length, stop drawing
-        if (sampleIndexCenter > (float)historySize) break;
+        float firstVal = getInterpolatedHistory(0.0f);
+        float startY = midY - (firstVal * midY * 0.9f * zoomY);
+        startY = juce::jlimit(0.0f, height, startY);
+        path.startNewSubPath(width, startY);
+
+        // For performance when Zoomed In, we iterate PIXELS (0 to width)
+        // and interpolate the audio value at that pixel.
+        for (float x = width - 2.0f; x > -2.0f; x -= 2.0f) // Step 2px for speed
+        {
+            float samplesAgo = (width - x) / zoomX;
+            
+            if (samplesAgo >= historySize) break;
+
+            float val = getInterpolatedHistory(samplesAgo);
+            float y = midY - (val * midY * 0.9f * zoomY);
+            y = juce::jlimit(0.0f, height, y);
+
+            path.lineTo(x, y);
+        }
     }
 
     g.setColour (juce::Colours::cyan);
-    g.strokePath (path, juce::PathStrokeType (1.5f)); // Slightly thinner for cleaner look
+    g.strokePath (path, juce::PathStrokeType (useOverview ? 1.0f : 2.0f));
 
-    // Text Overlay
+    // Info
     g.setColour(juce::Colours::white);
     g.setFont(14.0f);
-    g.drawText("Zoom X: " + juce::String(zoomX, 4) + " | Zoom Y: " + juce::String(zoomY, 2), 
+    juce::String mode = useOverview ? "Mode: OVERVIEW (Stable)" : "Mode: RAW (Detail)";
+    g.drawText(mode + " | Zoom X: " + juce::String(zoomX, 5), 
                10, 10, 300, 20, juce::Justification::topLeft);
 }
 
@@ -195,32 +178,21 @@ void SmoothScopeAudioProcessorEditor::mouseWheelMove(const juce::MouseEvent& eve
     
     if (event.mods.isCommandDown() || event.mods.isCtrlDown())
     {
-        // Zoom Y (Amplitude)
         zoomY += (scrollAmount * 1.0f);
         zoomY = juce::jlimit(minZoomY, maxZoomY, zoomY);
     }
     else
     {
-        // Zoom X (Time) - Logarithmic feel for better control
-        // If scrolling up (positive), we multiply (zoom in). 
-        // If scrolling down, we divide (zoom out).
-        
-        float scaleFactor = (scrollAmount > 0) ? 1.1f : 0.9f;
-        
-        // Apply stronger scaling if scrolling fast, or simply repeat
-        // We can also just add, but multiplication feels more natural for wide ranges
+        // Multiplicative zoom for vast ranges
         if (std::abs(scrollAmount) > 0.0f)
         {
-            if (scrollAmount > 0) zoomX *= 1.1f;
-            else                  zoomX *= 0.9f;
+            float factor = (scrollAmount > 0) ? 1.1f : 0.9f;
+            zoomX *= factor;
         }
-        
         zoomX = juce::jlimit(minZoomX, maxZoomX, zoomX);
     }
     
     repaint();
 }
 
-void SmoothScopeAudioProcessorEditor::resized()
-{
-}
+void SmoothScopeAudioProcessorEditor::resized() {}
