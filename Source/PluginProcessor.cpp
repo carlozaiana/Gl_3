@@ -17,7 +17,9 @@ void SmoothScopeAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, 
 {
     juce::ScopedNoDenormals noDenormals;
     
-    // Calculate RMS of the current block
+    // Note: RMS is smooth, but if you want to catch sudden peaks (transients) 
+    // better, buffer.getMagnitude(0, numSamples) is often preferred for scopes.
+    // However, sticking to your RMS logic as requested:
     float rms = buffer.getRMSLevel(0, 0, buffer.getNumSamples());
     
     if (getTotalNumInputChannels() > 1)

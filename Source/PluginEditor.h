@@ -19,21 +19,21 @@ private:
     SmoothScopeAudioProcessor& audioProcessor;
 
     // --- Visualization Data ---
-    // 1. HIGH RES BUFFER (Raw samples)
-    // Size = 1,048,576 (2^20). Approx 3 hours at 60fps updates.
+    // 1. RAW HISTORY (High Detail)
+    // 2^20 = ~1 Million samples. Approx 3-4 hours depending on block size/rate.
     static constexpr int historySize = 1048576; 
     std::vector<float> historyBuffer;
     int historyWriteIndex = 0;
 
-    // 2. LOW RES OVERVIEW BUFFER (Static Mipmap)
-    // Stores the Max of every 256 samples.
-    // This guarantees stability when zoomed out.
-    static constexpr int decimationFactor = 256;
+    // 2. OVERVIEW (Low Detail / High Performance)
+    // Stores the MAX value of every 'decimationFactor' samples.
+    // This prevents us from having to loop over millions of samples when zoomed out.
+    static constexpr int decimationFactor = 64;
     static constexpr int overviewSize = historySize / decimationFactor;
     std::vector<float> overviewBuffer;
     int overviewWriteIndex = 0;
 
-    // Accumulator for generating the overview
+    // Accumulators for generating the overview
     float currentBatchMax = 0.0f;
     int currentBatchCount = 0;
 
@@ -41,15 +41,18 @@ private:
     float zoomX = 1.0f;
     float zoomY = 1.0f;
 
-    // Constraints
-    const float minZoomX = 0.0001f; // Allows massive zoom out (entire buffer)
+    const float minZoomX = 0.0001f; 
     const float maxZoomX = 50.0f;
     const float minZoomY = 0.5f;
     const float maxZoomY = 10.0f;
     
-    // Helpers
-    float getInterpolatedHistory(float samplesAgo) const;
-    float getOverviewSample(int blocksAgo) const;
+    // --- Helpers ---
+    // Finds the Maximum value in the circular buffer within a specific range.
+    // Handles wrapping automatically.
+    float getMaxInRange(const std::vector<float>& buffer, int writeIndex, int startOffset, int endOffset) const;
+    
+    // Simple linear interpolation for extreme close-ups
+    float getInterpolatedValue(float sampleIndex) const;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (SmoothScopeAudioProcessorEditor)
 };

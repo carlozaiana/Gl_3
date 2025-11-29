@@ -30,14 +30,12 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override {}
     void setStateInformation (const void* data, int sizeInBytes) override {}
 
-    // --- Data Exchange for Visualization ---
-    // Simple thread-safe single-reader single-writer FIFO
+    // --- Data Exchange ---
     static constexpr int fifoSize = 1024;
     float fifoBuffer[fifoSize];
     std::atomic<int> fifoWriteIndex { 0 };
     std::atomic<int> fifoReadIndex { 0 };
 
-    // Helper to write to FIFO
     void pushToFifo(float rmsValue)
     {
         int currentWrite = fifoWriteIndex.load(std::memory_order_acquire);
