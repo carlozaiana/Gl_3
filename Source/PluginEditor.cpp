@@ -5,7 +5,9 @@ SmoothScopeAudioProcessorEditor::SmoothScopeAudioProcessorEditor (SmoothScopeAud
     : AudioProcessorEditor (&p), audioProcessor (p)
 {
     historyBuffer.resize(historySize, 0.0f);
-    overviewBuffer.resize(overviewSize, 0.0f);
+    
+    // Initialize overview buffer
+    overviewBuffer.resize(overviewSize, {0.0f, 0.0f});
 
     setResizable(true, true);
     setResizeLimits(300, 200, 2000, 1000);
@@ -35,22 +37,23 @@ void SmoothScopeAudioProcessorEditor::timerCallback()
         int nextRead = (currentRead + 1) % SmoothScopeAudioProcessor::fifoSize;
         audioProcessor.fifoReadIndex.store(nextRead, std::memory_order_release);
 
-        // 1. Store to Raw History
+        // 1. Update Raw History
         historyBuffer[historyWriteIndex] = val;
         historyWriteIndex = (historyWriteIndex + 1) % historySize;
 
-        // 2. Accumulate for Overview
-        // We track the Max value to preserve peaks when zoomed out
+        // 2. Accumulate Overview (Min/Max)
         if (val > currentOverviewMax) currentOverviewMax = val;
+        if (val < currentOverviewMin) currentOverviewMin = val;
         currentOverviewCounter++;
 
         if (currentOverviewCounter >= decimationFactor)
         {
-            overviewBuffer[overviewWriteIndex] = currentOverviewMax;
+            overviewBuffer[overviewWriteIndex] = { currentOverviewMin, currentOverviewMax };
             overviewWriteIndex = (overviewWriteIndex + 1) % overviewSize;
             
-            // Reset
+            // Reset Accumulators
             currentOverviewMax = 0.0f;
+            currentOverviewMin = 10.0f; // Reset to high value
             currentOverviewCounter = 0;
         }
         
@@ -74,78 +77,128 @@ void SmoothScopeAudioProcessorEditor::paint (juce::Graphics& g)
     g.drawHorizontalLine((int)midY, 0.0f, w);
 
     juce::Path path;
-    bool pathStarted = false;
 
-    // --- VISUALIZATION STRATEGY ---
-    // To avoid jitter ("jumping peaks"), we must iterate the DATA, not the pixels.
-    // We project the fixed data points onto the screen.
-    
-    // Threshold: When do we switch to the Overview buffer?
-    // If points in the Raw buffer are closer than 0.5 pixels, it's wasted effort and messy.
-    // We switch to Overview which has 64x fewer points.
-    
-    // zoomX is "pixels per raw sample".
-    bool useOverview = (zoomX < 0.05f); // Heuristic threshold
+    // Threshold for switching to pre-calculated overview
+    bool useOverview = (zoomX < 0.05f); 
 
     if (useOverview)
     {
-        // === DRAW OVERVIEW BUFFER ===
-        // Spacing between points in overview is 64x wider than raw
+        // === OVERVIEW MODE (Min/Max Candlesticks) ===
+        // Solves "Lost Down Peaks" by drawing the range between Min and Max
+        
         float pointSpacing = zoomX * (float)decimationFactor;
         
-        // Start from most recent (index 0 means "0 blocks ago")
         for (int i = 0; i < overviewSize; ++i)
         {
-            // Calculate Screen X based on buffer index.
-            // This maps the Data Grid (Stable) to Screen Grid.
             float x = w - ((float)i * pointSpacing);
-            
-            // Optimization: Stop if off screen
             if (x < -10.0f) break;
 
-            float val = getSample(overviewBuffer, overviewWriteIndex, i);
+            MinMax val = getSample(overviewBuffer, overviewWriteIndex, i);
             
-            // Draw symmetrical volume around center
-            float y = midY - (val * midY * 0.9f * zoomY);
-            y = juce::jlimit(0.0f, h, y);
-
-            if (!pathStarted) { path.startNewSubPath(x, y); pathStarted = true; }
-            else              { path.lineTo(x, y); }
+            // Calculate vertical range
+            // RMS is typically 0..1, so we draw up from midY
+            float yMax = midY - (val.max * midY * 0.9f * zoomY);
+            float yMin = midY - (val.min * midY * 0.9f * zoomY);
+            
+            yMax = juce::jlimit(0.0f, h, yMax);
+            yMin = juce::jlimit(0.0f, h, yMin);
+            
+            // Add a vertical bar (Rectangle with width ~1px or line)
+            // Using addRectangle is often cleaner for "bars" than drawing lines
+            // Width is the spacing, but clamped to look nice (e.g. min 1px)
+            float barWidth = std::max(1.0f, pointSpacing);
+            
+            // Note: yMax is technically "higher" visually but lower coordinate value than yMin
+            path.addRectangle(x - barWidth*0.5f, yMax, barWidth, std::abs(yMin - yMax));
         }
     }
     else
     {
-        // === DRAW RAW BUFFER ===
-        // Iterate every sample (step = 1). Do not skip!
-        // Skipping causes aliasing.
+        // === RAW MODE (Optimized Pixel Grouping) ===
+        // Solves "DAW Lag" by grouping samples into screen pixels
         
-        // We can optimize the loop count though:
-        // How many samples fit on screen? Width / zoomX
         int samplesToDraw = (int)std::ceil(w / zoomX) + 2;
         if (samplesToDraw > historySize) samplesToDraw = historySize;
 
+        // Logic: We iterate Data, but we group by Screen Pixel.
+        // We accumulate Min/Max for the current pixel column and draw 1 vertical line per pixel.
+        
+        int currentPixelX = -1000; // Sentinel
+        float pixelMax = -1.0f;
+        float pixelMin = 10.0f;
+
         for (int i = 0; i < samplesToDraw; ++i)
         {
-            float x = w - ((float)i * zoomX);
-            
-            float val = getSample(historyBuffer, historyWriteIndex, i);
-            
-            float y = midY - (val * midY * 0.9f * zoomY);
-            y = juce::jlimit(0.0f, h, y);
+            float rawX = w - ((float)i * zoomX);
+            int px = (int)rawX; // Snap to integer pixel
 
-            if (!pathStarted) { path.startNewSubPath(x, y); pathStarted = true; }
-            else              { path.lineTo(x, y); }
+            float val = getSample(historyBuffer, historyWriteIndex, i);
+
+            if (px != currentPixelX)
+            {
+                // We moved to a new pixel column. Draw the previous one.
+                if (currentPixelX > -1000 && pixelMax >= 0.0f)
+                {
+                    float yMax = midY - (pixelMax * midY * 0.9f * zoomY);
+                    float yMin = midY - (pixelMin * midY * 0.9f * zoomY);
+                    yMax = juce::jlimit(0.0f, h, yMax);
+                    yMin = juce::jlimit(0.0f, h, yMin);
+                    
+                    // If zoomed very close, just draw a line connecting to next point?
+                    // No, sticking to vertical bars is safer for preventing jumping peaks during scroll.
+                    // But if zoomX is large (e.g. 10px per sample), bars look weird.
+                    
+                    if (zoomX >= 1.0f)
+                    {
+                        // Standard Line Graph if high resolution
+                        // Note: This simple lineTo logic might miss "inter-sample" peaks if we had skipped, 
+                        // but we are iterating every sample here, so it's fine.
+                        if (path.isEmpty()) path.startNewSubPath(rawX + zoomX, yMax); // approximate prev
+                        path.lineTo(rawX + zoomX, yMax); // This connects samples roughly
+                    }
+                    else
+                    {
+                        // High Density: Vertical Bar (Pixel Snapping)
+                        // This is the Lag Fix.
+                        // We draw a vertical line from min to max at this X.
+                        path.startNewSubPath((float)currentPixelX, yMin);
+                        path.lineTo((float)currentPixelX, yMax);
+                    }
+                }
+
+                // Reset for new pixel
+                currentPixelX = px;
+                pixelMax = val;
+                pixelMin = val;
+            }
+            else
+            {
+                // Accumulate within the same pixel
+                if (val > pixelMax) pixelMax = val;
+                if (val < pixelMin) pixelMin = val;
+            }
         }
     }
 
     g.setColour (juce::Colours::cyan);
-    // Use a slightly thinner line for overview to keep it sharp
-    g.strokePath (path, juce::PathStrokeType (1.5f));
+    
+    // If we are drawing bars (overview or zoomed out raw), filling is often better/faster than stroking rects
+    // But stroking a path of lines is also fine.
+    if (useOverview || zoomX < 1.0f)
+    {
+        // High density / Overview look
+        g.strokePath (path, juce::PathStrokeType (1.0f));
+    }
+    else
+    {
+        // Smooth line look for close up
+        g.strokePath (path, juce::PathStrokeType (2.0f, juce::PathStrokeType::curved));
+    }
 
-    // Info Overlay
+    // Stats
     g.setColour(juce::Colours::white);
     g.setFont(14.0f);
-    juce::String mode = useOverview ? "Mode: OVERVIEW (Stable)" : "Mode: RAW (Detail)";
+    juce::String mode = useOverview ? "Mode: OVERVIEW (MinMax)" : "Mode: RAW (Pixel Grouped)";
     g.drawText(mode + " | Zoom: " + juce::String(zoomX, 5), 
                10, 10, 300, 20, juce::Justification::topLeft);
 }
@@ -156,13 +209,11 @@ void SmoothScopeAudioProcessorEditor::mouseWheelMove(const juce::MouseEvent& eve
     
     if (event.mods.isCommandDown() || event.mods.isCtrlDown())
     {
-        // Amplitude Zoom
         zoomY += (scrollAmount * 1.0f);
         zoomY = juce::jlimit(minZoomY, maxZoomY, zoomY);
     }
     else
     {
-        // Time Zoom
         if (std::abs(scrollAmount) > 0.0f)
         {
             float factor = (scrollAmount > 0) ? 1.1f : 0.9f;

@@ -3,6 +3,13 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
+// Simple struct to hold both peak and valley for a time range
+struct MinMax
+{
+    float min;
+    float max;
+};
+
 class SmoothScopeAudioProcessorEditor : public juce::AudioProcessorEditor,
                                         public juce::Timer
 {
@@ -18,43 +25,41 @@ public:
 private:
     SmoothScopeAudioProcessor& audioProcessor;
 
-    // --- 1. RAW BUFFER (Detailed) ---
-    // Stores the incoming RMS blocks directly.
-    // 1,048,576 samples covers ~3 hours at typical buffer rates (60fps logic).
+    // --- 1. RAW BUFFER (High Detail) ---
+    // 1 Million samples ~ 3 hours.
     static constexpr int historySize = 1048576; 
     std::vector<float> historyBuffer;
     int historyWriteIndex = 0;
 
-    // --- 2. OVERVIEW BUFFER (Stable for Zoom Out) ---
-    // Stores the MAX value of every 'decimationFactor' samples.
-    // 1048576 / 64 = ~16,384 points. Drawing 16k points is instant for the GPU.
+    // --- 2. OVERVIEW BUFFER (Min/Max) ---
+    // Stores Min/Max pairs to preserve down-peaks (silence) when zoomed out.
     static constexpr int decimationFactor = 64;
     static constexpr int overviewSize = historySize / decimationFactor;
-    std::vector<float> overviewBuffer;
+    std::vector<MinMax> overviewBuffer;
     int overviewWriteIndex = 0;
 
-    // Accumulator to calculate the max for the overview
+    // Accumulators for generating the overview
     float currentOverviewMax = 0.0f;
+    float currentOverviewMin = 10.0f; // Start high so first sample overwrites it
     int currentOverviewCounter = 0;
 
     // --- Zoom Parameters ---
-    float zoomX = 5.0f; // Default zoom: 5 pixels per sample (clearly visible)
+    float zoomX = 5.0f;
     float zoomY = 1.0f;
 
-    // Constraints
-    const float minZoomX = 0.0001f; // Allows full 3 hours on screen
+    const float minZoomX = 0.0001f;
     const float maxZoomX = 50.0f;
     const float minZoomY = 0.5f;
     const float maxZoomY = 10.0f;
     
     // Helper to get safe index from circular buffer
-    float getSample(const std::vector<float>& buffer, int writeIndex, int samplesAgo) const
+    template <typename T>
+    T getSample(const std::vector<T>& buffer, int writeIndex, int samplesAgo) const
     {
         int idx = writeIndex - 1 - samplesAgo;
         int size = (int)buffer.size();
-        // Fast wrap
         while (idx < 0) idx += size;
-        while (idx >= size) idx -= size; // Just in case
+        while (idx >= size) idx -= size;
         return buffer[idx];
     }
 
