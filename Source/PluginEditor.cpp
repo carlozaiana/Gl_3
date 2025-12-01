@@ -5,8 +5,6 @@ SmoothScopeAudioProcessorEditor::SmoothScopeAudioProcessorEditor (SmoothScopeAud
     : AudioProcessorEditor (&p), audioProcessor (p)
 {
     historyBuffer.resize(historySize, 0.0f);
-    
-    // Initialize overview buffer
     overviewBuffer.resize(overviewSize, {0.0f, 0.0f});
 
     setResizable(true, true);
@@ -41,7 +39,7 @@ void SmoothScopeAudioProcessorEditor::timerCallback()
         historyBuffer[historyWriteIndex] = val;
         historyWriteIndex = (historyWriteIndex + 1) % historySize;
 
-        // 2. Accumulate Overview (Min/Max)
+        // 2. Accumulate Overview
         if (val > currentOverviewMax) currentOverviewMax = val;
         if (val < currentOverviewMin) currentOverviewMin = val;
         currentOverviewCounter++;
@@ -51,7 +49,6 @@ void SmoothScopeAudioProcessorEditor::timerCallback()
             overviewBuffer[overviewWriteIndex] = { currentOverviewMin, currentOverviewMax };
             overviewWriteIndex = (overviewWriteIndex + 1) % overviewSize;
             
-            // Reset Accumulators
             currentOverviewMax = 0.0f;
             currentOverviewMin = 10.0f;
             currentOverviewCounter = 0;
@@ -76,21 +73,22 @@ void SmoothScopeAudioProcessorEditor::paint (juce::Graphics& g)
     g.setColour(juce::Colours::darkgrey.withAlpha(0.5f));
     g.drawHorizontalLine((int)midY, 0.0f, w);
 
-    // We will build two lists of points: one for the "Roof" (Max) and one for the "Floor" (Min).
-    // Then we connect them to form a filled shape.
-    std::vector<juce::Point<float>> roofPoints;
-    std::vector<juce::Point<float>> floorPoints;
-    
-    // Reserve memory to prevent reallocations during drawing
-    roofPoints.reserve((int)w + 2);
-    floorPoints.reserve((int)w + 2);
-
     bool useOverview = (zoomX < 0.05f); 
 
     if (useOverview)
     {
-        // === OVERVIEW MODE (Envelope) ===
-        // We iterate the Low-Res buffer
+        // === OVERVIEW MODE (Filled Envelope) ===
+        // Used for extreme zoom out. Draws density.
+        
+        juce::Path roofPath;
+        juce::Path floorPath;
+        
+        // Build vectors first to create a closed shape
+        std::vector<juce::Point<float>> pointsMax;
+        std::vector<juce::Point<float>> pointsMin;
+        pointsMax.reserve((int)w);
+        pointsMin.reserve((int)w);
+
         float pointSpacing = zoomX * (float)decimationFactor;
         
         for (int i = 0; i < overviewSize; ++i)
@@ -103,140 +101,93 @@ void SmoothScopeAudioProcessorEditor::paint (juce::Graphics& g)
             float yMax = midY - (val.max * midY * 0.9f * zoomY);
             float yMin = midY - (val.min * midY * 0.9f * zoomY);
             
+            // Clamp
             yMax = juce::jlimit(0.0f, h, yMax);
             yMin = juce::jlimit(0.0f, h, yMin);
             
-            roofPoints.emplace_back(x, yMax);
-            floorPoints.emplace_back(x, yMin);
+            pointsMax.emplace_back(x, yMax);
+            pointsMin.emplace_back(x, yMin);
+        }
+
+        // Construct filled path
+        if (!pointsMax.empty())
+        {
+            juce::Path fillPath;
+            fillPath.startNewSubPath(pointsMax[0]);
+            for (size_t i = 1; i < pointsMax.size(); ++i) fillPath.lineTo(pointsMax[i]);
+            for (int i = (int)pointsMin.size() - 1; i >= 0; --i) fillPath.lineTo(pointsMin[i]);
+            fillPath.closeSubPath();
+
+            g.setColour(juce::Colours::cyan.withAlpha(0.5f));
+            g.fillPath(fillPath);
+            
+            g.setColour(juce::Colours::cyan);
+            g.strokePath(fillPath, juce::PathStrokeType(1.0f));
         }
     }
     else
     {
-        // === RAW MODE ===
-        
-        if (zoomX >= 1.0f)
+        // === RAW MODE (Optimized Line Graph) ===
+        // Used for High Zoom AND Mid Zoom.
+        // We discarded the "Min" value here to prevent Moiré interference.
+        // We use Pixel Grouping (finding Max per pixel) to prevent lag.
+
+        juce::Path path;
+        bool started = false;
+
+        int samplesToDraw = (int)std::ceil(w / zoomX) + 2;
+        if (samplesToDraw > historySize) samplesToDraw = historySize;
+
+        int currentPixelX = -1000;
+        float pixelMax = -1.0f;
+
+        for (int i = 0; i < samplesToDraw; ++i)
         {
-            // HIGH DETAIL ZOOM (Line Graph)
-            // When pixels are spread apart, we just draw a simple line.
-            // Filling doesn't make sense here as points are distinct.
-            
-            juce::Path linePath;
-            bool started = false;
-            
-            int samplesToDraw = (int)std::ceil(w / zoomX) + 2;
-            if (samplesToDraw > historySize) samplesToDraw = historySize;
+            float rawX = w - ((float)i * zoomX);
+            int px = (int)rawX;
 
-            for (int i = 0; i < samplesToDraw; ++i)
+            float val = getSample(historyBuffer, historyWriteIndex, i);
+
+            if (px != currentPixelX)
             {
-                float x = w - ((float)i * zoomX);
-                float val = getSample(historyBuffer, historyWriteIndex, i);
-                float y = midY - (val * midY * 0.9f * zoomY);
-                y = juce::jlimit(0.0f, h, y);
-
-                if (!started) { linePath.startNewSubPath(x, y); started = true; }
-                else          { linePath.lineTo(x, y); }
-            }
-            
-            g.setColour(juce::Colours::cyan);
-            g.strokePath(linePath, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved));
-            
-            // Draw stats and exit early
-            g.setColour(juce::Colours::white);
-            g.setFont(14.0f);
-            g.drawText("Mode: RAW (Line) | Zoom: " + juce::String(zoomX, 5), 
-                       10, 10, 300, 20, juce::Justification::topLeft);
-            return;
-        }
-        else
-        {
-            // MID ZOOM (Envelope Fill)
-            // This fixes the "Flicker". 
-            // We group samples by pixel, calculate Min/Max for that pixel, 
-            // and store them to build a smooth filled shape later.
-            
-            int samplesToDraw = (int)std::ceil(w / zoomX) + 2;
-            if (samplesToDraw > historySize) samplesToDraw = historySize;
-
-            int currentPixelX = -1000;
-            float pixelMax = -1.0f;
-            float pixelMin = 10.0f;
-
-            for (int i = 0; i < samplesToDraw; ++i)
-            {
-                float rawX = w - ((float)i * zoomX);
-                int px = (int)rawX;
-
-                float val = getSample(historyBuffer, historyWriteIndex, i);
-
-                if (px != currentPixelX)
+                // New pixel column reached. Draw the Max of the previous column.
+                if (currentPixelX > -1000 && pixelMax >= 0.0f)
                 {
-                    // Pixel changed: Push the accumulated results of the PREVIOUS pixel
-                    if (currentPixelX > -1000 && pixelMax >= 0.0f)
-                    {
-                        float yMax = midY - (pixelMax * midY * 0.9f * zoomY);
-                        float yMin = midY - (pixelMin * midY * 0.9f * zoomY);
-                        
-                        // Clamp
-                        yMax = juce::jlimit(0.0f, h, yMax);
-                        yMin = juce::jlimit(0.0f, h, yMin);
+                    float y = midY - (pixelMax * midY * 0.9f * zoomY);
+                    y = juce::jlimit(0.0f, h, y);
 
-                        // Add to our shape lists
-                        float xPos = (float)currentPixelX;
-                        roofPoints.emplace_back(xPos, yMax);
-                        floorPoints.emplace_back(xPos, yMin);
+                    if (!started) 
+                    { 
+                        path.startNewSubPath((float)currentPixelX, y); 
+                        started = true; 
                     }
+                    else 
+                    { 
+                        path.lineTo((float)currentPixelX, y); 
+                    }
+                }
 
-                    // Reset for new pixel
-                    currentPixelX = px;
-                    pixelMax = val;
-                    pixelMin = val;
-                }
-                else
-                {
-                    // Accumulate min/max within the same pixel column
-                    if (val > pixelMax) pixelMax = val;
-                    if (val < pixelMin) pixelMin = val;
-                }
+                // Reset
+                currentPixelX = px;
+                pixelMax = val;
+            }
+            else
+            {
+                // Still in same pixel, keep finding the Max
+                if (val > pixelMax) pixelMax = val;
             }
         }
-    }
 
-    // === CONSTRUCT THE ENVELOPE SHAPE ===
-    if (!roofPoints.empty())
-    {
-        juce::Path envelopePath;
-        
-        // 1. Trace the Roof (Left to Right, or Right to Left depending on loop order)
-        // Our loops ran Right (screen width) to Left (0). So roofPoints[0] is at the Right.
-        
-        envelopePath.startNewSubPath(roofPoints[0]);
-        for (size_t i = 1; i < roofPoints.size(); ++i)
-            envelopePath.lineTo(roofPoints[i]);
-
-        // 2. Connect to Floor
-        // We want to draw the floor from Left (history) back to Right (now) to close the loop
-        // The floorPoints vector is currently Right -> Left.
-        // So we iterate it backwards.
-        
-        for (int i = (int)floorPoints.size() - 1; i >= 0; --i)
-            envelopePath.lineTo(floorPoints[i]);
-
-        // 3. Close the shape (connects last floor point back to first roof point)
-        envelopePath.closeSubPath();
-
-        // Draw Fill
-        g.setColour(juce::Colours::cyan.withAlpha(0.6f)); // Slightly transparent fill
-        g.fillPath(envelopePath);
-        
-        // Draw Outline (optional, adds definition)
+        // Draw with a slightly thicker line to prevent aliasing "sparkles"
+        // and to make the line feel solid like the overview block.
         g.setColour(juce::Colours::cyan);
-        g.strokePath(envelopePath, juce::PathStrokeType(1.0f));
+        g.strokePath(path, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved));
     }
 
     // Stats
     g.setColour(juce::Colours::white);
     g.setFont(14.0f);
-    juce::String mode = useOverview ? "Mode: OVERVIEW (Envelope)" : "Mode: RAW (Envelope)";
+    juce::String mode = useOverview ? "Mode: OVERVIEW (Envelope)" : "Mode: RAW (Stable Line)";
     g.drawText(mode + " | Zoom: " + juce::String(zoomX, 5), 
                10, 10, 300, 20, juce::Justification::topLeft);
 }
